@@ -15,7 +15,7 @@ from byte import Encrypt_ID, encrypt_api
 app = Flask(__name__)
 
 # -----------------------------
-# CONFIG
+# REGION CONFIGURATION
 # -----------------------------
 REGION_CONFIG = {
     'ind': {'domain': 'client.ind.freefiremobile.com', 'token_file': 'tokens_ind.json'},
@@ -24,211 +24,218 @@ REGION_CONFIG = {
     'pk': {'domain': 'clientbp.ggpolarbear.com', 'token_file': 'tokens_pk.json'}
 }
 
+# -----------------------------
+# TOKEN AUTO REFRESH CONFIG
+# -----------------------------
 TOKEN_API_URL = "http://jwt.thug4ff.xyz/token"
-
 ACCOUNT_FILES = {
     "IND": "accounts-IND.json",
     "VN": "accounts-VN.json",
     "ME": "accounts-ME.json",
     "PK": "accounts-PK.json"
 }
-
-# chống spam refresh
-last_refresh = {}
+TOKEN_OUTPUT_FILES = {
+    "IND": "tokens_ind.json",
+    "VN": "tokens_vn.json",
+    "ME": "tokens_me.json",
+    "PK": "tokens_pk.json"
+}
+token_rotation = {}
 
 # -----------------------------
-# TOKEN UTILS
+# UTILITY FUNCTIONS
 # -----------------------------
 def load_tokens(region):
     try:
-        with open(REGION_CONFIG[region]['token_file'], "r") as f:
+        config = REGION_CONFIG.get(region)
+        if not config:
+            return None
+        with open(config['token_file'], "r") as f:
             return json.load(f)
     except:
-        return []
+        return None
 
-def save_tokens(region, tokens):
-    with open(REGION_CONFIG[region]['token_file'], "w") as f:
-        json.dump(tokens, f, indent=4)
-
-def load_accounts(region):
-    try:
-        with open(ACCOUNT_FILES[region.upper()], "r") as f:
-            return json.load(f)
-    except:
-        return []
-
-def fetch_token(acc):
-    try:
-        url = f"{TOKEN_API_URL}?uid={acc['uid']}&password={acc['password']}"
-        res = requests.get(url, timeout=6)
-        data = res.json()
-        token = data.get("token")
-        if token and token != "N/A":
-            return token
-    except:
-        pass
-    return None
-
-def should_refresh(region):
-    now = time.time()
-    if region not in last_refresh or now - last_refresh[region] > 300:
-        last_refresh[region] = now
-        return True
-    return False
-
-def refresh_region_tokens(region):
-    print(f"[REFRESH] {region.upper()}")
-
-    accounts = load_accounts(region)
-    if not accounts:
-        print("No accounts")
-        return
-
-    old_tokens = load_tokens(region)
-    new_tokens = []
-
-    for acc in accounts:
-        token = fetch_token(acc)
-        if token:
-            new_tokens.append({"token": token})
-        time.sleep(5)
-
-    if new_tokens:
-        combined = old_tokens + new_tokens
-        unique = [dict(t) for t in {tuple(d.items()) for d in combined}]
-        save_tokens(region, unique)
-        print(f"[DONE] {len(unique)} tokens")
-
-# -----------------------------
-# AUTO REFRESH 5H
-# -----------------------------
-def token_refresh_loop():
-    print("[AUTO REFRESH STARTED - 5H]")
-    while True:
-        for region in ACCOUNT_FILES.keys():
-            refresh_region_tokens(region)
-
-        print("Sleeping 5 hours...")
-        time.sleep(5 * 60 * 60)
-
-# -----------------------------
-# ENCRYPT
-# -----------------------------
-def encrypt_message(data):
+def encrypt_message(plaintext_bytes):
     key = b'Yg&tc%DEuh6%Zc^8'
     iv = b'6oyZDr22E3ychjM%'
     cipher = AES.new(key, AES.MODE_CBC, iv)
-    return binascii.hexlify(cipher.encrypt(pad(data, AES.block_size))).decode()
+    padded = pad(plaintext_bytes, AES.block_size)
+    encrypted = cipher.encrypt(padded)
+    return binascii.hexlify(encrypted).decode('utf-8')
 
-def create_uid(uid):
+def create_uid_protobuf(uid):
     msg = danger_generator_pb2.danger_generator()
     msg.saturn_ = int(uid)
     msg.garena = 1
     return msg.SerializeToString()
 
 def enc(uid):
-    return encrypt_message(create_uid(uid))
+    pb = create_uid_protobuf(uid)
+    return encrypt_message(pb)
 
-def decode_info(binary):
-    msg = danger_count_pb2.Danger_ff_like()
-    msg.ParseFromString(binary)
-    return msg
+def decode_player_info(binary):
+    info = danger_count_pb2.Danger_ff_like()
+    info.ParseFromString(binary)
+    return info
 
-# -----------------------------
-# PLAYER INFO
-# -----------------------------
 def get_player_info(uid, region):
     tokens = load_tokens(region)
-    if not tokens:
-        return None, None
-
+    if tokens is None or len(tokens) == 0:
+        return None, None, region
     token = tokens[0]['token']
-    url = f"https://{REGION_CONFIG[region]['domain']}/GetPlayerPersonalShow"
+    config = REGION_CONFIG.get(region)
+    url = f"https://{config['domain']}/GetPlayerPersonalShow"
+
+    encrypted_uid = enc(uid)
+    edata = bytes.fromhex(encrypted_uid)
+
+    headers = {
+        'User-Agent': "Dalvik/2.1.0",
+        'Connection': "Keep-Alive",
+        'Accept-Encoding': "gzip",
+        'Authorization': f"Bearer {token}",
+        'Content-Type': "application/x-www-form-urlencoded",
+        'X-Unity-Version': "2018.4.11f1",
+        'X-GA': "v1 1",
+        'ReleaseVersion': "OB52"
+    }
 
     try:
-        res = requests.post(url, data=bytes.fromhex(enc(uid)),
-                            headers={"Authorization": f"Bearer {token}"},
-                            verify=False, timeout=10)
-
-        if res.status_code == 401 and should_refresh(region):
-            refresh_region_tokens(region)
-            return None, None
-
-        data = json.loads(MessageToJson(decode_info(res.content)))
-        acc = data.get("AccountInfo", {})
-
-        return acc.get("PlayerNickname", "Unknown"), acc.get("UID", uid)
+        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=10)
+        if response.status_code != 200:
+            return None, None, region
+        info = decode_player_info(response.content)
+        data = json.loads(MessageToJson(info))
+        account = data.get("AccountInfo", {})
+        player_name = account.get("PlayerNickname", "Unknown")
+        player_uid = account.get("UID", uid)
+        return player_name, player_uid, region
     except:
-        return None, None
+        return None, None, region
 
-# -----------------------------
-# SEND REQUEST
-# -----------------------------
-def send_request(uid, token, domain, region, results, lock):
+def send_friend_request(uid, token, domain, results, lock):
     try:
-        payload = f"08a7c4839f1e10{Encrypt_ID(uid)}1801"
-        enc_payload = encrypt_api(payload)
-
-        res = requests.post(
-            f"https://{domain}/RequestAddingFriend",
-            data=bytes.fromhex(enc_payload),
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10
-        )
-
+        encrypted_id = Encrypt_ID(uid)
+        payload = f"08a7c4839f1e10{encrypted_id}1801"
+        encrypted_payload = encrypt_api(payload)
+        url = f"https://{domain}/RequestAddingFriend"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Unity-Version": "2018.4.11f1",
+            "X-GA": "v1 1",
+            "ReleaseVersion": "OB52",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Dalvik/2.1.0"
+        }
+        response = requests.post(url, data=bytes.fromhex(encrypted_payload), headers=headers, timeout=10)
         with lock:
-            if res.status_code == 200:
-                results["success"] += 1
-            elif res.status_code == 401:
-                results["failed"] += 1
-                if should_refresh(region):
-                    print("401 → refresh")
-                    refresh_region_tokens(region)
+            if response.status_code == 200:
+                results['success'] += 1
             else:
-                results["failed"] += 1
-
-        time.sleep(3)
-
+                results['failed'] += 1
+        time.sleep(10)
     except:
         with lock:
-            results["failed"] += 1
+            results['failed'] += 1
 
 # -----------------------------
-# API
+# FLASK ENDPOINTS
 # -----------------------------
-@app.route("/send_requests")
-def send_requests():
+@app.route("/send_requests", methods=["GET"])
+def handle_friend_request():
     uid = request.args.get("uid")
-    region = request.args.get("region", "vn").lower()
-
+    region = request.args.get("region", "ind").lower()
     if not uid:
-        return {"error": "uid required"}
+        return Response(json.dumps({"error": "uid required"}), mimetype="application/json")
+    if region not in REGION_CONFIG:
+        return Response(json.dumps({"error": f"Invalid region. Supported: {', '.join(REGION_CONFIG.keys())}"}), mimetype="application/json")
 
     tokens = load_tokens(region)
     if not tokens:
-        return {"error": "no tokens"}
+        return Response(json.dumps({"error": f"No tokens for region {region}"}), mimetype="application/json")
 
-    name, player_uid = get_player_info(uid, region)
-    if not name:
-        return {"error": "player not found"}
+    player_name, player_uid, region = get_player_info(uid, region)
+    if not player_name:
+        return Response(json.dumps({"error": "Player not found"}), mimetype="application/json")
+
+    config = REGION_CONFIG.get(region)
+    domain = config['domain']
 
     results = {"success": 0, "failed": 0}
     lock = threading.Lock()
-    domain = REGION_CONFIG[region]['domain']
 
-    for tk in tokens[:50]:
-        send_request(uid, tk['token'], domain, region, results, lock)
+    for i in range(min(len(tokens), 100)):
+        token = tokens[i]['token']
+        send_friend_request(uid, token, domain, results, lock)
 
-    return OrderedDict([
-        ("PlayerName", name),
+    output = OrderedDict([
+        ("PlayerName", player_name),
         ("UID", player_uid),
+        ("Region", region.upper()),
         ("Success", results["success"]),
-        ("Failed", results["failed"])
+        ("Failed", results["failed"]),
+        ("Status", 1 if results["success"] > 0 else 2)
     ])
+    return Response(json.dumps(output), mimetype="application/json")
 
-@app.route("/regions")
-def regions():
-    return {"regions": list(REGION_CONFIG.keys())}
+@app.route("/regions", methods=["GET"])
+def list_regions():
+    regions = [{"code": code, "domain": config['domain'], "token_file": config['token_file']} for code, config in REGION_CONFIG.items()]
+    return Response(json.dumps({"regions": regions}), mimetype="application/json")
+
+# -----------------------------
+# TOKEN REFRESH LOGIC
+# -----------------------------
+def load_accounts(file_path):
+    try:
+        with open(file_path, "r") as f:
+            return json.load(f)
+    except:
+        return []
+
+def fetch_token(account):
+    uid = account.get("uid")
+    password = account.get("password")
+    if not uid or not password:
+        return None
+    try:
+        url = f"{TOKEN_API_URL}?uid={uid}&password={password}"
+        resp = requests.get(url, timeout=6)
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("token")
+        if token and token != "N/A":
+            return token
+        return None
+    except:
+        return None
+
+def refresh_region_tokens(region):
+    print(f"[Refresh] {region} started")
+    accounts = load_accounts(ACCOUNT_FILES.get(region))
+    output_file = TOKEN_OUTPUT_FILES.get(region)
+    if not accounts:
+        print(f"[Refresh] No accounts for {region}")
+        return
+    new_tokens = []
+    for account in accounts:
+        token = fetch_token(account)
+        if token:
+            new_tokens.append({"token": token})
+        time.sleep(10)
+    if new_tokens:
+        with open(output_file, "w") as f:
+            json.dump(new_tokens, f, indent=4)
+        token_rotation[region] = new_tokens
+        print(f"[Refresh] {region} updated. Total tokens: {len(new_tokens)}")
+    else:
+        print(f"[Refresh] No valid tokens for {region}")
+
+def token_refresh_loop():
+    print("[Refresh] Token refresh loop started (10s per token)")
+    while True:
+        for region in ACCOUNT_FILES.keys():
+            refresh_region_tokens(region)
 
 # -----------------------------
 # MAIN
@@ -236,6 +243,4 @@ def regions():
 if __name__ == "__main__":
     t = threading.Thread(target=token_refresh_loop, daemon=True)
     t.start()
-
-    print("Server running...")
-    app.run(host="0.0.0.0", port=5000)
+    app.run(debug=True, host="0.0.0.0", port=5000)
